@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash VARCHAR(255) NOT NULL,
   display_name VARCHAR(120) NOT NULL,
   avatar_url TEXT,
+  role ENUM('user', 'admin') NOT NULL DEFAULT 'user',
   rating DECIMAL(2,1) NOT NULL DEFAULT 5.0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -74,6 +75,15 @@ CREATE TABLE IF NOT EXISTS item_images (
   item_id BIGINT NOT NULL,
   image_url MEDIUMTEXT NOT NULL,
   display_order INT NOT NULL DEFAULT 0,
+  FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS item_likes (
+  user_id BIGINT NOT NULL,
+  item_id BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, item_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
 );
 

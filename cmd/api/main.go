@@ -41,6 +41,7 @@ type store struct {
 	users        map[int64]User
 	usersByEmail map[string]int64
 	items        map[int64]Item
+	itemLikes    map[int64]map[int64]bool
 	transactions map[int64]Transaction
 	messages     map[int64][]Message
 	reviews      map[int64]Review
@@ -52,6 +53,7 @@ type User struct {
 	PasswordHash string    `json:"-"`
 	DisplayName  string    `json:"displayName"`
 	AvatarURL    string    `json:"avatarUrl"`
+	Role         string    `json:"role"`
 	Rating       float64   `json:"rating"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
@@ -70,6 +72,8 @@ type Item struct {
 	Context         string    `json:"context"`
 	Images          []string  `json:"images"`
 	SellerCanDelete bool      `json:"sellerCanDelete"`
+	LikeCount       int       `json:"likeCount"`
+	LikedByMe       bool      `json:"likedByMe"`
 	SellerHidden    bool      `json:"-"`
 	CreatedAt       time.Time `json:"createdAt"`
 }
@@ -268,6 +272,7 @@ func main() {
 	mux.HandleFunc("PATCH /me", a.requireAuth(a.updateMe))
 	mux.HandleFunc("GET /me/items", a.requireAuth(a.listMyItems))
 	mux.HandleFunc("GET /me/reviews", a.requireAuth(a.listMyReviews))
+	mux.HandleFunc("GET /admin/stats", a.requireRole("admin", a.adminStats))
 	mux.HandleFunc("POST /uploads", a.requireAuth(a.uploadImage))
 	mux.Handle("GET /uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(env("UPLOAD_DIR", "uploads")))))
 	mux.HandleFunc("GET /items", a.listItems)
@@ -275,6 +280,8 @@ func main() {
 	mux.HandleFunc("GET /items/{id}", a.getItem)
 	mux.HandleFunc("PATCH /items/{id}", a.requireAuth(a.updateItem))
 	mux.HandleFunc("DELETE /items/{id}", a.requireAuth(a.deleteItem))
+	mux.HandleFunc("POST /items/{id}/like", a.requireAuth(a.likeItem))
+	mux.HandleFunc("DELETE /items/{id}/like", a.requireAuth(a.unlikeItem))
 	mux.HandleFunc("POST /items/{id}/purchase-requests", a.requireAuth(a.createPurchaseRequest))
 	mux.HandleFunc("GET /transactions", a.requireAuth(a.listTransactions))
 	mux.HandleFunc("DELETE /transactions/{id}", a.requireAuth(a.deleteTransaction))
@@ -307,6 +314,7 @@ func newStore() *store {
 		users:        map[int64]User{},
 		usersByEmail: map[string]int64{},
 		items:        map[int64]Item{},
+		itemLikes:    map[int64]map[int64]bool{},
 		transactions: map[int64]Transaction{},
 		messages:     map[int64][]Message{},
 		reviews:      map[int64]Review{},
@@ -357,10 +365,21 @@ func migrateDB(db *sql.DB) error {
 		return err
 	}
 	_, _ = db.Exec("ALTER TABLE item_images MODIFY image_url MEDIUMTEXT NOT NULL")
+	_, _ = db.Exec("ALTER TABLE users ADD COLUMN role ENUM('user', 'admin') NOT NULL DEFAULT 'user'")
 	_, _ = db.Exec("ALTER TABLE items ADD COLUMN category_id BIGINT NOT NULL DEFAULT 801")
 	_, _ = db.Exec("ALTER TABLE items ADD COLUMN seller_hidden BOOLEAN NOT NULL DEFAULT FALSE")
 	_, _ = db.Exec("ALTER TABLE transactions ADD COLUMN buyer_hidden BOOLEAN NOT NULL DEFAULT FALSE")
 	_, _ = db.Exec("ALTER TABLE transactions ADD COLUMN seller_hidden BOOLEAN NOT NULL DEFAULT FALSE")
+	_, _ = db.Exec(`
+		CREATE TABLE IF NOT EXISTS item_likes (
+			user_id BIGINT NOT NULL,
+			item_id BIGINT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user_id, item_id),
+			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+			FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+		)
+	`)
 	return nil
 }
 
@@ -368,16 +387,17 @@ func loadStore(db *sql.DB, s *store) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	users, err := db.Query("SELECT id, email, password_hash, display_name, COALESCE(avatar_url, ''), rating, created_at FROM users ORDER BY id")
+	users, err := db.Query("SELECT id, email, password_hash, display_name, COALESCE(avatar_url, ''), COALESCE(role, 'user'), rating, created_at FROM users ORDER BY id")
 	if err != nil {
 		return err
 	}
 	defer users.Close()
 	for users.Next() {
 		var user User
-		if err := users.Scan(&user.ID, &user.Email, &user.PasswordHash, &user.DisplayName, &user.AvatarURL, &user.Rating, &user.CreatedAt); err != nil {
+		if err := users.Scan(&user.ID, &user.Email, &user.PasswordHash, &user.DisplayName, &user.AvatarURL, &user.Role, &user.Rating, &user.CreatedAt); err != nil {
 			return err
 		}
+		normalizeUserRole(&user)
 		s.users[user.ID] = user
 		s.usersByEmail[user.Email] = user.ID
 		if user.ID >= s.nextUserID {
@@ -424,6 +444,22 @@ func loadStore(db *sql.DB, s *store) error {
 		s.items[itemID] = item
 	}
 	if err := images.Err(); err != nil {
+		return err
+	}
+
+	likes, err := db.Query("SELECT user_id, item_id FROM item_likes")
+	if err != nil {
+		return err
+	}
+	defer likes.Close()
+	for likes.Next() {
+		var userID, itemID int64
+		if err := likes.Scan(&userID, &itemID); err != nil {
+			return err
+		}
+		s.addLikeInMemory(userID, itemID)
+	}
+	if err := likes.Err(); err != nil {
 		return err
 	}
 
@@ -533,11 +569,12 @@ func (s *store) saveUser(user User) error {
 	if s.db == nil {
 		return nil
 	}
+	normalizeUserRole(&user)
 	_, err := s.db.Exec(`
-		INSERT INTO users (id, email, password_hash, display_name, avatar_url, rating, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON DUPLICATE KEY UPDATE email = VALUES(email), password_hash = VALUES(password_hash), display_name = VALUES(display_name), avatar_url = VALUES(avatar_url), rating = VALUES(rating)
-	`, user.ID, user.Email, user.PasswordHash, user.DisplayName, user.AvatarURL, user.Rating, user.CreatedAt)
+		INSERT INTO users (id, email, password_hash, display_name, avatar_url, role, rating, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE email = VALUES(email), password_hash = VALUES(password_hash), display_name = VALUES(display_name), avatar_url = VALUES(avatar_url), role = VALUES(role), rating = VALUES(rating)
+	`, user.ID, user.Email, user.PasswordHash, user.DisplayName, user.AvatarURL, user.Role, user.Rating, user.CreatedAt)
 	return err
 }
 
@@ -603,6 +640,28 @@ func (s *store) saveReview(review Review) error {
 		ON DUPLICATE KEY UPDATE rating = VALUES(rating), comment = VALUES(comment)
 	`, review.ID, review.TransactionID, review.ReviewerID, review.RevieweeID, review.Rating, review.Comment)
 	return err
+}
+
+func (s *store) saveLike(userID, itemID int64) error {
+	if s.db == nil {
+		return nil
+	}
+	_, err := s.db.Exec("INSERT IGNORE INTO item_likes (user_id, item_id) VALUES (?, ?)", userID, itemID)
+	return err
+}
+
+func (s *store) deleteLike(userID, itemID int64) error {
+	if s.db == nil {
+		return nil
+	}
+	_, err := s.db.Exec("DELETE FROM item_likes WHERE user_id = ? AND item_id = ?", userID, itemID)
+	return err
+}
+
+func normalizeUserRole(user *User) {
+	if user.Role != "admin" {
+		user.Role = "user"
+	}
 }
 
 func (s *store) recalculateUserRating(userID int64) error {
@@ -709,6 +768,40 @@ func (s *store) sellerCanDeleteItem(item Item) bool {
 	return false
 }
 
+func (s *store) likeCount(itemID int64) int {
+	return len(s.itemLikes[itemID])
+}
+
+func (s *store) userLikesItem(userID, itemID int64) bool {
+	if userID == 0 {
+		return false
+	}
+	return s.itemLikes[itemID][userID]
+}
+
+func (s *store) addLikeInMemory(userID, itemID int64) {
+	if s.itemLikes[itemID] == nil {
+		s.itemLikes[itemID] = map[int64]bool{}
+	}
+	s.itemLikes[itemID][userID] = true
+}
+
+func (s *store) removeLikeInMemory(userID, itemID int64) {
+	if s.itemLikes[itemID] == nil {
+		return
+	}
+	delete(s.itemLikes[itemID], userID)
+	if len(s.itemLikes[itemID]) == 0 {
+		delete(s.itemLikes, itemID)
+	}
+}
+
+func (s *store) enrichItem(item Item, userID int64) Item {
+	item.LikeCount = s.likeCount(item.ID)
+	item.LikedByMe = s.userLikesItem(userID, item.ID)
+	return item
+}
+
 func (s *store) itemHasIncompleteTransaction(itemID, sellerID int64) bool {
 	for _, txn := range s.transactions {
 		if txn.ItemID == itemID && txn.SellerID == sellerID && txn.Status != "done" {
@@ -720,7 +813,7 @@ func (s *store) itemHasIncompleteTransaction(itemID, sellerID int64) bool {
 
 func (s *store) enrichItemForSeller(item Item) Item {
 	item.SellerCanDelete = s.sellerCanDeleteItem(item)
-	return item
+	return s.enrichItem(item, item.SellerID)
 }
 
 func (s *store) purgeItemByTitle(title string) error {
@@ -789,6 +882,7 @@ func (s *store) purgeItemByTitle(title string) error {
 	}
 	for _, itemID := range itemIDs {
 		delete(s.items, itemID)
+		delete(s.itemLikes, itemID)
 	}
 	for userID := range s.users {
 		if err := s.recalculateUserRating(userID); err != nil {
@@ -802,11 +896,11 @@ func seed(s *store) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	hash, _ := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
-	user := User{ID: s.nextUserID, Email: "demo@capcycle.test", PasswordHash: string(hash), DisplayName: "Kumazo", AvatarURL: "", Rating: 4.8, CreatedAt: time.Now()}
+	user := User{ID: s.nextUserID, Email: "demo@capcycle.test", PasswordHash: string(hash), DisplayName: "Kumazo", AvatarURL: "", Role: "user", Rating: 4.8, CreatedAt: time.Now()}
 	s.nextUserID++
 	s.users[user.ID] = user
 	s.usersByEmail[user.Email] = user.ID
-	buyer := User{ID: s.nextUserID, Email: "buyer@capcycle.test", PasswordHash: string(hash), DisplayName: "Buyer", AvatarURL: "", Rating: 5, CreatedAt: time.Now()}
+	buyer := User{ID: s.nextUserID, Email: "buyer@capcycle.test", PasswordHash: string(hash), DisplayName: "Buyer", AvatarURL: "", Role: "user", Rating: 5, CreatedAt: time.Now()}
 	s.nextUserID++
 	s.users[buyer.ID] = buyer
 	s.usersByEmail[buyer.Email] = buyer.ID
@@ -849,7 +943,7 @@ func (a *app) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "email already registered")
 		return
 	}
-	user := User{ID: a.store.nextUserID, Email: req.Email, PasswordHash: string(hash), DisplayName: req.DisplayName, Rating: 5, CreatedAt: time.Now()}
+	user := User{ID: a.store.nextUserID, Email: req.Email, PasswordHash: string(hash), DisplayName: req.DisplayName, Role: "user", Rating: 5, CreatedAt: time.Now()}
 	a.store.nextUserID++
 	a.store.users[user.ID] = user
 	a.store.usersByEmail[user.Email] = user.ID
@@ -857,7 +951,7 @@ func (a *app) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to save user")
 		return
 	}
-	token := a.signToken(user.ID)
+	token := a.signToken(user)
 	writeJSON(w, http.StatusCreated, map[string]any{"user": user, "token": token})
 }
 
@@ -877,7 +971,7 @@ func (a *app) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": user, "token": a.signToken(user.ID)})
+	writeJSON(w, http.StatusOK, map[string]any{"user": user, "token": a.signToken(user)})
 }
 
 func (a *app) me(w http.ResponseWriter, r *http.Request, user User) {
@@ -931,6 +1025,21 @@ func (a *app) listMyReviews(w http.ResponseWriter, r *http.Request, user User) {
 	writeJSON(w, http.StatusOK, map[string]any{"reviews": reviews})
 }
 
+func (a *app) adminStats(w http.ResponseWriter, r *http.Request, user User) {
+	a.store.mu.RLock()
+	defer a.store.mu.RUnlock()
+	likeCount := 0
+	for _, users := range a.store.itemLikes {
+		likeCount += len(users)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"users":        len(a.store.users),
+		"items":        len(a.store.items),
+		"transactions": len(a.store.transactions),
+		"likes":        likeCount,
+	})
+}
+
 func (a *app) listItems(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	category := strings.ToLower(r.URL.Query().Get("category"))
@@ -950,6 +1059,7 @@ func (a *app) listItems(w http.ResponseWriter, r *http.Request) {
 	if limit < 1 || limit > 50 {
 		limit = 12
 	}
+	viewerID := a.optionalUserID(r)
 	a.store.mu.RLock()
 	var all []Item
 	for _, item := range a.store.items {
@@ -974,16 +1084,16 @@ func (a *app) listItems(w http.ResponseWriter, r *http.Request) {
 		if maxPrice > 0 && item.Price > maxPrice {
 			continue
 		}
-		all = append(all, item)
+		all = append(all, a.store.enrichItem(item, viewerID))
 	}
 	a.store.mu.RUnlock()
 	sort.SliceStable(all, func(i, j int) bool {
 		switch sortMode {
 		case "popular":
-			return all[i].ConditionScore > all[j].ConditionScore
+			return all[i].LikeCount*1000+all[i].ConditionScore > all[j].LikeCount*1000+all[j].ConditionScore
 		case "recommended":
-			left := all[i].ConditionScore*100 - all[i].Price/100
-			right := all[j].ConditionScore*100 - all[j].Price/100
+			left := all[i].LikeCount*500 + all[i].ConditionScore*100 - all[i].Price/100
+			right := all[j].LikeCount*500 + all[j].ConditionScore*100 - all[j].Price/100
 			return left > right
 		default:
 			return all[i].CreatedAt.After(all[j].CreatedAt)
@@ -1006,8 +1116,12 @@ func (a *app) getItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid item id")
 		return
 	}
+	viewerID := a.optionalUserID(r)
 	a.store.mu.RLock()
 	item, ok := a.store.items[id]
+	if ok {
+		item = a.store.enrichItem(item, viewerID)
+	}
 	a.store.mu.RUnlock()
 	if !ok || item.SellerHidden || item.Status == "draft" {
 		writeError(w, http.StatusNotFound, "item not found")
@@ -1041,7 +1155,7 @@ func (a *app) createItem(w http.ResponseWriter, r *http.Request, user User) {
 		writeError(w, http.StatusInternalServerError, "failed to save item")
 		return
 	}
-	writeJSON(w, http.StatusCreated, req)
+	writeJSON(w, http.StatusCreated, a.store.enrichItemForSeller(req))
 }
 
 func (a *app) updateItem(w http.ResponseWriter, r *http.Request, user User) {
@@ -1104,7 +1218,7 @@ func (a *app) updateItem(w http.ResponseWriter, r *http.Request, user User) {
 		writeError(w, http.StatusInternalServerError, "failed to save item")
 		return
 	}
-	writeJSON(w, http.StatusOK, item)
+	writeJSON(w, http.StatusOK, a.store.enrichItemForSeller(item))
 }
 
 func (a *app) deleteItem(w http.ResponseWriter, r *http.Request, user User) {
@@ -1161,6 +1275,48 @@ func (a *app) deleteItem(w http.ResponseWriter, r *http.Request, user User) {
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
+func (a *app) likeItem(w http.ResponseWriter, r *http.Request, user User) {
+	a.changeItemLike(w, r, user, true)
+}
+
+func (a *app) unlikeItem(w http.ResponseWriter, r *http.Request, user User) {
+	a.changeItemLike(w, r, user, false)
+}
+
+func (a *app) changeItemLike(w http.ResponseWriter, r *http.Request, user User, liked bool) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid item id")
+		return
+	}
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	item, ok := a.store.items[id]
+	if !ok || item.SellerHidden || item.Status == "draft" {
+		writeError(w, http.StatusNotFound, "item not found")
+		return
+	}
+	if liked {
+		a.store.addLikeInMemory(user.ID, id)
+		if err := a.store.saveLike(user.ID, id); err != nil {
+			a.store.removeLikeInMemory(user.ID, id)
+			writeError(w, http.StatusInternalServerError, "failed to like item")
+			return
+		}
+	} else {
+		wasLiked := a.store.userLikesItem(user.ID, id)
+		a.store.removeLikeInMemory(user.ID, id)
+		if err := a.store.deleteLike(user.ID, id); err != nil {
+			if wasLiked {
+				a.store.addLikeInMemory(user.ID, id)
+			}
+			writeError(w, http.StatusInternalServerError, "failed to unlike item")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, a.store.enrichItem(item, user.ID))
+}
+
 func (a *app) createPurchaseRequest(w http.ResponseWriter, r *http.Request, user User) {
 	itemID, err := pathID(r, "id")
 	if err != nil {
@@ -1199,6 +1355,7 @@ func (a *app) createPurchaseRequest(w http.ResponseWriter, r *http.Request, user
 		writeError(w, http.StatusInternalServerError, "failed to save item")
 		return
 	}
+	item = a.store.enrichItem(item, user.ID)
 	txn := Transaction{ID: a.store.nextTxnID, ItemID: item.ID, BuyerID: user.ID, SellerID: item.SellerID, Status: status, CreatedAt: time.Now(), Item: &item}
 	a.store.nextTxnID++
 	a.store.transactions[txn.ID] = txn
@@ -1221,7 +1378,7 @@ func (a *app) listTransactions(w http.ResponseWriter, r *http.Request, user User
 			if txn.SellerID == user.ID && txn.SellerHidden {
 				continue
 			}
-			item := a.store.items[txn.ItemID]
+			item := a.store.enrichItem(a.store.items[txn.ItemID], user.ID)
 			txn.Item = &item
 			txn = a.store.enrichTransaction(txn, user.ID)
 			txns = append(txns, txn)
@@ -1689,13 +1846,13 @@ func (a *app) recommendations(w http.ResponseWriter, r *http.Request, user User)
 	var all []Item
 	for _, item := range a.store.items {
 		if item.Status == "published" && item.SellerID != user.ID {
-			all = append(all, item)
+			all = append(all, a.store.enrichItem(item, user.ID))
 		}
 	}
 	a.store.mu.RUnlock()
 	sort.SliceStable(all, func(i, j int) bool {
-		left := categoryWeight[all[i].Category]*10000 + all[i].ConditionScore*100 - all[i].Price/100
-		right := categoryWeight[all[j].Category]*10000 + all[j].ConditionScore*100 - all[j].Price/100
+		left := categoryWeight[all[i].Category]*10000 + all[i].LikeCount*500 + all[i].ConditionScore*100 - all[i].Price/100
+		right := categoryWeight[all[j].Category]*10000 + all[j].LikeCount*500 + all[j].ConditionScore*100 - all[j].Price/100
 		return left > right
 	})
 	start := (page - 1) * limit
@@ -1719,57 +1876,104 @@ func (a *app) canAccessTransaction(txnID, userID int64) bool {
 func (a *app) requireAuth(next func(http.ResponseWriter, *http.Request, User)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		userID, err := a.verifyToken(token)
+		claims, err := a.verifyToken(token)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
 		a.store.mu.RLock()
-		user, ok := a.store.users[userID]
+		user, ok := a.store.users[claims.Sub]
 		a.store.mu.RUnlock()
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "user not found")
+			return
+		}
+		if claims.Role != "" && claims.Role != user.Role {
+			writeError(w, http.StatusUnauthorized, "stale token")
 			return
 		}
 		next(w, r, user)
 	}
 }
 
-func (a *app) signToken(userID int64) string {
+func (a *app) requireRole(role string, next func(http.ResponseWriter, *http.Request, User)) http.HandlerFunc {
+	return a.requireAuth(func(w http.ResponseWriter, r *http.Request, user User) {
+		if user.Role != role {
+			writeError(w, http.StatusForbidden, "insufficient role")
+			return
+		}
+		next(w, r, user)
+	})
+}
+
+func (a *app) optionalUserID(r *http.Request) int64 {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	claims, err := a.verifyToken(token)
+	if err != nil {
+		return 0
+	}
+	a.store.mu.RLock()
+	user, ok := a.store.users[claims.Sub]
+	a.store.mu.RUnlock()
+	if !ok || (claims.Role != "" && claims.Role != user.Role) {
+		return 0
+	}
+	return claims.Sub
+}
+
+type tokenClaims struct {
+	Sub  int64  `json:"sub"`
+	Role string `json:"role"`
+	Iat  int64  `json:"iat"`
+	Exp  int64  `json:"exp"`
+}
+
+func (a *app) signToken(user User) string {
 	header := b64(`{"alg":"HS256","typ":"JWT"}`)
-	payload := b64(fmt.Sprintf(`{"sub":%d,"exp":%d}`, userID, time.Now().Add(24*time.Hour).Unix()))
+	normalizeUserRole(&user)
+	now := time.Now()
+	payloadBytes, _ := json.Marshal(tokenClaims{
+		Sub:  user.ID,
+		Role: user.Role,
+		Iat:  now.Unix(),
+		Exp:  now.Add(24 * time.Hour).Unix(),
+	})
+	payload := base64.RawURLEncoding.EncodeToString(payloadBytes)
 	body := header + "." + payload
 	mac := hmac.New(sha256.New, a.jwtSecret)
 	mac.Write([]byte(body))
 	return body + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-func (a *app) verifyToken(token string) (int64, error) {
+func (a *app) verifyToken(token string) (tokenClaims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return 0, errors.New("invalid token")
+		return tokenClaims{}, errors.New("invalid token")
 	}
 	body := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, a.jwtSecret)
 	mac.Write([]byte(body))
 	if !hmac.Equal([]byte(parts[2]), []byte(base64.RawURLEncoding.EncodeToString(mac.Sum(nil)))) {
-		return 0, errors.New("invalid signature")
+		return tokenClaims{}, errors.New("invalid signature")
 	}
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return 0, err
+		return tokenClaims{}, err
 	}
-	var payload struct {
-		Sub int64 `json:"sub"`
-		Exp int64 `json:"exp"`
-	}
+	var payload tokenClaims
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return 0, err
+		return tokenClaims{}, err
+	}
+	if payload.Sub <= 0 || payload.Exp <= 0 {
+		return tokenClaims{}, errors.New("invalid claims")
 	}
 	if time.Now().Unix() > payload.Exp {
-		return 0, errors.New("expired token")
+		return tokenClaims{}, errors.New("expired token")
 	}
-	return payload.Sub, nil
+	if payload.Role != "" && payload.Role != "user" && payload.Role != "admin" {
+		return tokenClaims{}, errors.New("invalid role")
+	}
+	return payload, nil
 }
 
 type mockAssistant struct{}
