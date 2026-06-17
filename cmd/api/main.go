@@ -60,20 +60,21 @@ type User struct {
 }
 
 type Item struct {
-	ID             int64     `json:"id"`
-	SellerID       int64     `json:"sellerId"`
-	Title          string    `json:"title"`
-	Description    string    `json:"description"`
-	Price          int       `json:"price"`
-	ShippingFee    int       `json:"shippingFee"`
-	CategoryID     int64     `json:"categoryId"`
-	Category       string    `json:"category"`
-	Status         string    `json:"status"`
-	ConditionScore int       `json:"conditionScore"`
-	Context        string    `json:"context"`
-	Images         []string  `json:"images"`
-	SellerHidden   bool      `json:"-"`
-	CreatedAt      time.Time `json:"createdAt"`
+	ID              int64     `json:"id"`
+	SellerID        int64     `json:"sellerId"`
+	Title           string    `json:"title"`
+	Description     string    `json:"description"`
+	Price           int       `json:"price"`
+	ShippingFee     int       `json:"shippingFee"`
+	CategoryID      int64     `json:"categoryId"`
+	Category        string    `json:"category"`
+	Status          string    `json:"status"`
+	ConditionScore  int       `json:"conditionScore"`
+	Context         string    `json:"context"`
+	Images          []string  `json:"images"`
+	SellerCanDelete bool      `json:"sellerCanDelete"`
+	SellerHidden    bool      `json:"-"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 type Transaction struct {
@@ -87,6 +88,8 @@ type Transaction struct {
 	Item            *Item      `json:"item,omitempty"`
 	MyReviewed      bool       `json:"myReviewed"`
 	PartnerReviewed bool       `json:"partnerReviewed"`
+	ItemUnavailable bool       `json:"itemUnavailable"`
+	UnavailableText string     `json:"unavailableText,omitempty"`
 	BuyerHidden     bool       `json:"-"`
 	SellerHidden    bool       `json:"-"`
 }
@@ -238,6 +241,9 @@ func main() {
 		}
 		if err := loadStore(db, s); err != nil {
 			log.Fatalf("failed to load database: %v", err)
+		}
+		if err := s.purgeItemByTitle("Persistence Test Jacket"); err != nil {
+			log.Fatalf("failed to remove obsolete item: %v", err)
 		}
 		log.Printf("MySQL persistence enabled")
 	}
@@ -672,6 +678,127 @@ func (s *store) enrichReview(review Review) Review {
 	return review
 }
 
+func (s *store) reviewVisibleToUser(review Review, userID int64) bool {
+	txn, ok := s.transactions[review.TransactionID]
+	if !ok {
+		return true
+	}
+	if review.ReviewerID == userID {
+		return true
+	}
+	if userID == txn.SellerID {
+		sellerReviewed, _ := s.reviewState(txn, userID)
+		return sellerReviewed
+	}
+	return true
+}
+
+func (s *store) sellerCanDeleteItem(item Item) bool {
+	if s.itemHasIncompleteTransaction(item.ID, item.SellerID) {
+		return false
+	}
+	if item.Status != "sold" {
+		return true
+	}
+	for _, txn := range s.transactions {
+		if txn.ItemID != item.ID || txn.SellerID != item.SellerID || txn.Status != "done" {
+			continue
+		}
+		sellerReviewed, buyerReviewed := s.reviewState(txn, item.SellerID)
+		return sellerReviewed && buyerReviewed
+	}
+	return false
+}
+
+func (s *store) itemHasIncompleteTransaction(itemID, sellerID int64) bool {
+	for _, txn := range s.transactions {
+		if txn.ItemID == itemID && txn.SellerID == sellerID && txn.Status != "done" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *store) enrichItemForSeller(item Item) Item {
+	item.SellerCanDelete = s.sellerCanDeleteItem(item)
+	return item
+}
+
+func (s *store) purgeItemByTitle(title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var itemIDs []int64
+	for id, item := range s.items {
+		if item.Title == title {
+			itemIDs = append(itemIDs, id)
+		}
+	}
+	if len(itemIDs) == 0 {
+		return nil
+	}
+	itemSet := map[int64]bool{}
+	for _, id := range itemIDs {
+		itemSet[id] = true
+	}
+	var txnIDs []int64
+	for id, txn := range s.transactions {
+		if itemSet[txn.ItemID] {
+			txnIDs = append(txnIDs, id)
+		}
+	}
+	txnSet := map[int64]bool{}
+	for _, id := range txnIDs {
+		txnSet[id] = true
+	}
+	if s.db != nil {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for _, txnID := range txnIDs {
+			if _, err := tx.Exec("DELETE FROM reviews WHERE transaction_id = ?", txnID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("DELETE FROM messages WHERE transaction_id = ?", txnID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("DELETE FROM transactions WHERE id = ?", txnID); err != nil {
+				return err
+			}
+		}
+		for _, itemID := range itemIDs {
+			if _, err := tx.Exec("DELETE FROM item_images WHERE item_id = ?", itemID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("DELETE FROM items WHERE id = ?", itemID); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	for _, txnID := range txnIDs {
+		delete(s.transactions, txnID)
+		delete(s.messages, txnID)
+	}
+	for reviewID, review := range s.reviews {
+		if txnSet[review.TransactionID] {
+			delete(s.reviews, reviewID)
+		}
+	}
+	for _, itemID := range itemIDs {
+		delete(s.items, itemID)
+	}
+	for userID := range s.users {
+		if err := s.recalculateUserRating(userID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func seed(s *store) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -787,7 +914,7 @@ func (a *app) listMyItems(w http.ResponseWriter, r *http.Request, user User) {
 	var items []Item
 	for _, item := range a.store.items {
 		if item.SellerID == user.ID && !item.SellerHidden {
-			items = append(items, item)
+			items = append(items, a.store.enrichItemForSeller(item))
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
@@ -798,7 +925,7 @@ func (a *app) listMyReviews(w http.ResponseWriter, r *http.Request, user User) {
 	defer a.store.mu.RUnlock()
 	var reviews []Review
 	for _, review := range a.store.reviews {
-		if review.RevieweeID == user.ID {
+		if review.RevieweeID == user.ID && a.store.reviewVisibleToUser(review, user.ID) {
 			reviews = append(reviews, a.store.enrichReview(review))
 		}
 	}
@@ -978,7 +1105,7 @@ func (a *app) getItem(w http.ResponseWriter, r *http.Request) {
 	a.store.mu.RLock()
 	item, ok := a.store.items[id]
 	a.store.mu.RUnlock()
-	if !ok || item.SellerHidden {
+	if !ok || item.SellerHidden || item.Status == "draft" {
 		writeError(w, http.StatusNotFound, "item not found")
 		return
 	}
@@ -1051,6 +1178,10 @@ func (a *app) updateItem(w http.ResponseWriter, r *http.Request, user User) {
 	}
 	normalizeItemCategory(&item)
 	if req.Status != "" {
+		if req.Status != "published" && req.Status != item.Status && a.store.itemHasIncompleteTransaction(item.ID, user.ID) {
+			writeError(w, http.StatusBadRequest, "item with active transaction cannot be unpublished")
+			return
+		}
 		item.Status = req.Status
 		if req.Status == "published" {
 			item.SellerHidden = false
@@ -1084,6 +1215,35 @@ func (a *app) deleteItem(w http.ResponseWriter, r *http.Request, user User) {
 	if !ok || item.SellerID != user.ID {
 		writeError(w, http.StatusNotFound, "item not found")
 		return
+	}
+	if a.store.itemHasIncompleteTransaction(item.ID, user.ID) {
+		writeError(w, http.StatusBadRequest, "item with active transaction cannot be deleted")
+		return
+	}
+	if item.Status == "sold" {
+		var soldTxn *Transaction
+		for _, txn := range a.store.transactions {
+			if txn.ItemID == item.ID && txn.SellerID == user.ID {
+				nextTxn := txn
+				soldTxn = &nextTxn
+				break
+			}
+		}
+		if soldTxn == nil || soldTxn.Status != "done" {
+			writeError(w, http.StatusBadRequest, "sold item transaction is not complete")
+			return
+		}
+		sellerReviewed, buyerReviewed := a.store.reviewState(*soldTxn, user.ID)
+		if !sellerReviewed || !buyerReviewed {
+			writeError(w, http.StatusBadRequest, "sold item waiting for review cannot be deleted")
+			return
+		}
+		soldTxn.SellerHidden = true
+		a.store.transactions[soldTxn.ID] = *soldTxn
+		if err := a.store.saveTransaction(*soldTxn); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete transaction")
+			return
+		}
 	}
 	item.SellerHidden = true
 	if item.Status == "published" {
@@ -1328,6 +1488,13 @@ func (a *app) createReview(w http.ResponseWriter, r *http.Request, user User) {
 		writeError(w, http.StatusBadRequest, "rating must be 1-5")
 		return
 	}
+	if user.ID == txn.SellerID {
+		_, buyerReviewed := a.store.reviewState(txn, user.ID)
+		if !buyerReviewed {
+			writeError(w, http.StatusBadRequest, "seller can review after buyer review")
+			return
+		}
+	}
 	for _, existing := range a.store.reviews {
 		if existing.TransactionID == id && existing.ReviewerID == user.ID {
 			writeError(w, http.StatusConflict, "review already submitted")
@@ -1366,7 +1533,7 @@ func (a *app) listReviews(w http.ResponseWriter, r *http.Request, user User) {
 	defer a.store.mu.RUnlock()
 	var reviews []Review
 	for _, review := range a.store.reviews {
-		if review.TransactionID == id {
+		if review.TransactionID == id && a.store.reviewVisibleToUser(review, user.ID) {
 			reviews = append(reviews, a.store.enrichReview(review))
 		}
 	}
@@ -1394,12 +1561,13 @@ func (a *app) priceSuggest(w http.ResponseWriter, r *http.Request, user User) {
 		Category       string   `json:"category"`
 		ConditionScore int      `json:"conditionScore"`
 		Title          string   `json:"title"`
+		TargetSellDays int      `json:"targetSellDays"`
 		Images         []string `json:"images"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	result, err := suggestPriceWithAI(r.Context(), req.Title, req.Description, req.CategoryID, req.Category, req.ConditionScore, req.Images)
+	result, err := suggestPriceWithAI(r.Context(), req.Title, req.Description, req.CategoryID, req.Category, req.ConditionScore, req.TargetSellDays, req.Images)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -1432,7 +1600,7 @@ type ListingCheckResult struct {
 	Reasons []string `json:"reasons"`
 }
 
-func suggestPriceWithAI(ctx context.Context, title, description string, categoryID int64, category string, conditionScore int, imageURLs []string) (PriceSuggestionResult, error) {
+func suggestPriceWithAI(ctx context.Context, title, description string, categoryID int64, category string, conditionScore, targetSellDays int, imageURLs []string) (PriceSuggestionResult, error) {
 	if categoryID == 0 {
 		categoryID = categoryIDByLabel(category)
 	}
@@ -1440,11 +1608,18 @@ func suggestPriceWithAI(ctx context.Context, title, description string, category
 	if conditionScore <= 0 {
 		conditionScore = 75
 	}
+	if targetSellDays <= 0 {
+		targetSellDays = 7
+	}
+	if targetSellDays > 60 {
+		targetSellDays = 60
+	}
 	if os.Getenv("GEMINI_API_KEY") == "" {
-		return heuristicPriceSuggestion(category, conditionScore), nil
+		return heuristicPriceSuggestion(category, conditionScore, targetSellDays), nil
 	}
 	prompt := fmt.Sprintf(
-		"あなたはCapCycleの中古相場アナリストです。JSONのみを返してください。schema: {\"suggestedPrice\":number,\"marketRange\":number[],\"sellThroughDays\":number}。marketRangeは[min,max]の2要素。日本円で、10〜20代向けフリマの売れやすさを重視してください。\n商品名: %s\n説明: %s\nカテゴリID: %d\nカテゴリ: %s\n状態スコア: %d",
+		"あなたはCapCycleの中古相場アナリストです。JSONのみを返してください。schema: {\"suggestedPrice\":number,\"marketRange\":number[],\"sellThroughDays\":number}。marketRangeは[min,max]の2要素。日本円で、10〜20代向けフリマの売れやすさを重視してください。ユーザーは約%d日以内に売りたいので、その日数に合う価格を提案してください。\n商品名: %s\n説明: %s\nカテゴリID: %d\nカテゴリ: %s\n状態スコア: %d",
+		targetSellDays,
 		title,
 		description,
 		categoryID,
@@ -1466,7 +1641,7 @@ func suggestPriceWithAI(ctx context.Context, title, description string, category
 	return result, nil
 }
 
-func heuristicPriceSuggestion(category string, conditionScore int) PriceSuggestionResult {
+func heuristicPriceSuggestion(category string, conditionScore, targetSellDays int) PriceSuggestionResult {
 	base := 6800
 	switch {
 	case strings.Contains(category, "スマートフォン"), strings.Contains(category, "PC"), strings.Contains(category, "カメラ"), strings.Contains(category, "オーディオ"):
@@ -1485,10 +1660,18 @@ func heuristicPriceSuggestion(category string, conditionScore int) PriceSuggesti
 		base = 1800
 	}
 	price := base * max(conditionScore, 50) / 80
+	switch {
+	case targetSellDays <= 3:
+		price = price * 85 / 100
+	case targetSellDays <= 7:
+		price = price * 95 / 100
+	case targetSellDays >= 21:
+		price = price * 110 / 100
+	}
 	return PriceSuggestionResult{
 		SuggestedPrice:  price,
 		MarketRange:     []int{price * 85 / 100, price * 115 / 100},
-		SellThroughDays: 4,
+		SellThroughDays: targetSellDays,
 	}
 }
 
