@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -42,6 +43,7 @@ type store struct {
 	usersByEmail map[string]int64
 	items        map[int64]Item
 	itemLikes    map[int64]map[int64]bool
+	itemViews    map[int64][]ItemView
 	transactions map[int64]Transaction
 	messages     map[int64][]Message
 	reviews      map[int64]Review
@@ -74,8 +76,18 @@ type Item struct {
 	SellerCanDelete bool      `json:"sellerCanDelete"`
 	LikeCount       int       `json:"likeCount"`
 	LikedByMe       bool      `json:"likedByMe"`
+	ViewCount       int       `json:"viewCount"`
+	RecentViewCount int       `json:"recentViewCount"`
+	ViewVelocity    float64   `json:"viewVelocity"`
 	SellerHidden    bool      `json:"-"`
 	CreatedAt       time.Time `json:"createdAt"`
+}
+
+type ItemView struct {
+	ItemID     int64
+	ViewerID   int64
+	ViewerHash string
+	CreatedAt  time.Time
 }
 
 type Transaction struct {
@@ -128,6 +140,43 @@ type ItemQuestionRequest struct {
 
 type ItemQuestionResult struct {
 	Answer string `json:"answer"`
+}
+
+type ItemMetrics struct {
+	ViewCount       int     `json:"viewCount"`
+	RecentViewCount int     `json:"recentViewCount"`
+	ViewVelocity    float64 `json:"viewVelocity"`
+	LikeCount       int     `json:"likeCount"`
+}
+
+type DynamicPriceRequest struct {
+	ItemID          int64   `json:"itemId"`
+	Title           string  `json:"title"`
+	CategoryID      int64   `json:"categoryId"`
+	Category        string  `json:"category"`
+	CurrentPrice    int     `json:"currentPrice"`
+	ConditionScore  int     `json:"conditionScore"`
+	LikeCount       int     `json:"likeCount"`
+	ViewCount       int     `json:"viewCount"`
+	RecentViewCount int     `json:"recentViewCount"`
+	ViewVelocity    float64 `json:"viewVelocity"`
+	TargetSellDays  int     `json:"targetSellDays"`
+	MinimumPrice    int     `json:"minimumPrice"`
+}
+
+type DynamicPricePoint struct {
+	Day             int     `json:"day"`
+	Price           int     `json:"price"`
+	SellProbability float64 `json:"sellProbability"`
+}
+
+type DynamicPriceResult struct {
+	RecommendedPrice int                 `json:"recommendedPrice"`
+	ExpectedSellDays int                 `json:"expectedSellDays"`
+	PricePath        []DynamicPricePoint `json:"pricePath"`
+	MarketRange      []int               `json:"marketRange"`
+	Confidence       float64             `json:"confidence"`
+	Explanation      string              `json:"explanation"`
 }
 
 type ListingAssistResult struct {
@@ -278,6 +327,7 @@ func main() {
 	mux.HandleFunc("GET /items", a.listItems)
 	mux.HandleFunc("POST /items", a.requireAuth(a.createItem))
 	mux.HandleFunc("GET /items/{id}", a.getItem)
+	mux.HandleFunc("GET /items/{id}/metrics", a.requireAuth(a.itemMetrics))
 	mux.HandleFunc("PATCH /items/{id}", a.requireAuth(a.updateItem))
 	mux.HandleFunc("DELETE /items/{id}", a.requireAuth(a.deleteItem))
 	mux.HandleFunc("POST /items/{id}/like", a.requireAuth(a.likeItem))
@@ -294,6 +344,7 @@ func main() {
 	mux.HandleFunc("POST /transactions/{id}/reviews", a.requireAuth(a.createReview))
 	mux.HandleFunc("POST /ai/listing-assist", a.requireAuth(a.listingAssist))
 	mux.HandleFunc("POST /ai/price-suggest", a.requireAuth(a.priceSuggest))
+	mux.HandleFunc("POST /ai/dynamic-price", a.requireAuth(a.dynamicPrice))
 	mux.HandleFunc("POST /ai/fraud-check", a.requireAuth(a.fraudCheck))
 	mux.HandleFunc("POST /ai/item-question", a.requireAuth(a.itemQuestion))
 	mux.HandleFunc("GET /ai/gemini-status", a.requireAuth(a.geminiStatus))
@@ -315,6 +366,7 @@ func newStore() *store {
 		usersByEmail: map[string]int64{},
 		items:        map[int64]Item{},
 		itemLikes:    map[int64]map[int64]bool{},
+		itemViews:    map[int64][]ItemView{},
 		transactions: map[int64]Transaction{},
 		messages:     map[int64][]Message{},
 		reviews:      map[int64]Review{},
@@ -378,6 +430,19 @@ func migrateDB(db *sql.DB) error {
 			PRIMARY KEY (user_id, item_id),
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 			FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+		)
+	`)
+	_, _ = db.Exec(`
+		CREATE TABLE IF NOT EXISTS item_views (
+			id BIGINT PRIMARY KEY AUTO_INCREMENT,
+			item_id BIGINT NOT NULL,
+			viewer_id BIGINT NULL,
+			viewer_hash CHAR(64) NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			INDEX idx_item_views_item_created (item_id, created_at),
+			INDEX idx_item_views_viewer (item_id, viewer_hash, created_at),
+			FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+			FOREIGN KEY (viewer_id) REFERENCES users(id) ON DELETE SET NULL
 		)
 	`)
 	return nil
@@ -460,6 +525,22 @@ func loadStore(db *sql.DB, s *store) error {
 		s.addLikeInMemory(userID, itemID)
 	}
 	if err := likes.Err(); err != nil {
+		return err
+	}
+
+	views, err := db.Query("SELECT item_id, COALESCE(viewer_id, 0), viewer_hash, created_at FROM item_views ORDER BY item_id, created_at")
+	if err != nil {
+		return err
+	}
+	defer views.Close()
+	for views.Next() {
+		var view ItemView
+		if err := views.Scan(&view.ItemID, &view.ViewerID, &view.ViewerHash, &view.CreatedAt); err != nil {
+			return err
+		}
+		s.itemViews[view.ItemID] = append(s.itemViews[view.ItemID], view)
+	}
+	if err := views.Err(); err != nil {
 		return err
 	}
 
@@ -658,6 +739,24 @@ func (s *store) deleteLike(userID, itemID int64) error {
 	return err
 }
 
+func (s *store) saveItemView(view ItemView) error {
+	if s.db == nil {
+		return nil
+	}
+	var viewerID any
+	if view.ViewerID > 0 {
+		viewerID = view.ViewerID
+	}
+	_, err := s.db.Exec(
+		"INSERT INTO item_views (item_id, viewer_id, viewer_hash, created_at) VALUES (?, ?, ?, ?)",
+		view.ItemID,
+		viewerID,
+		view.ViewerHash,
+		view.CreatedAt,
+	)
+	return err
+}
+
 func normalizeUserRole(user *User) {
 	if user.Role != "admin" {
 		user.Role = "user"
@@ -796,9 +895,48 @@ func (s *store) removeLikeInMemory(userID, itemID int64) {
 	}
 }
 
+func (s *store) itemMetrics(itemID int64) ItemMetrics {
+	now := time.Now()
+	recentSince := now.Add(-24 * time.Hour)
+	velocitySince := now.Add(-72 * time.Hour)
+	metrics := ItemMetrics{LikeCount: s.likeCount(itemID)}
+	for _, view := range s.itemViews[itemID] {
+		metrics.ViewCount++
+		if view.CreatedAt.After(recentSince) {
+			metrics.RecentViewCount++
+		}
+		if view.CreatedAt.After(velocitySince) {
+			metrics.ViewVelocity += 1.0 / 3.0
+		}
+	}
+	metrics.ViewVelocity = math.Round(metrics.ViewVelocity*10) / 10
+	return metrics
+}
+
+func (s *store) shouldRecordView(itemID int64, viewerHash string, now time.Time) bool {
+	for i := len(s.itemViews[itemID]) - 1; i >= 0; i-- {
+		view := s.itemViews[itemID][i]
+		if now.Sub(view.CreatedAt) > 30*time.Minute {
+			return true
+		}
+		if view.ViewerHash == viewerHash {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *store) addViewInMemory(view ItemView) {
+	s.itemViews[view.ItemID] = append(s.itemViews[view.ItemID], view)
+}
+
 func (s *store) enrichItem(item Item, userID int64) Item {
 	item.LikeCount = s.likeCount(item.ID)
 	item.LikedByMe = s.userLikesItem(userID, item.ID)
+	metrics := s.itemMetrics(item.ID)
+	item.ViewCount = metrics.ViewCount
+	item.RecentViewCount = metrics.RecentViewCount
+	item.ViewVelocity = metrics.ViewVelocity
 	return item
 }
 
@@ -883,6 +1021,7 @@ func (s *store) purgeItemByTitle(title string) error {
 	for _, itemID := range itemIDs {
 		delete(s.items, itemID)
 		delete(s.itemLikes, itemID)
+		delete(s.itemViews, itemID)
 	}
 	for userID := range s.users {
 		if err := s.recalculateUserRating(userID); err != nil {
@@ -1032,11 +1171,16 @@ func (a *app) adminStats(w http.ResponseWriter, r *http.Request, user User) {
 	for _, users := range a.store.itemLikes {
 		likeCount += len(users)
 	}
+	viewCount := 0
+	for _, views := range a.store.itemViews {
+		viewCount += len(views)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"users":        len(a.store.users),
 		"items":        len(a.store.items),
 		"transactions": len(a.store.transactions),
 		"likes":        likeCount,
+		"views":        viewCount,
 	})
 }
 
@@ -1090,10 +1234,12 @@ func (a *app) listItems(w http.ResponseWriter, r *http.Request) {
 	sort.SliceStable(all, func(i, j int) bool {
 		switch sortMode {
 		case "popular":
-			return all[i].LikeCount*1000+all[i].ConditionScore > all[j].LikeCount*1000+all[j].ConditionScore
+			left := all[i].LikeCount*1000 + all[i].RecentViewCount*120 + int(all[i].ViewVelocity*80) + all[i].ConditionScore
+			right := all[j].LikeCount*1000 + all[j].RecentViewCount*120 + int(all[j].ViewVelocity*80) + all[j].ConditionScore
+			return left > right
 		case "recommended":
-			left := all[i].LikeCount*500 + all[i].ConditionScore*100 - all[i].Price/100
-			right := all[j].LikeCount*500 + all[j].ConditionScore*100 - all[j].Price/100
+			left := all[i].LikeCount*500 + all[i].RecentViewCount*100 + int(all[i].ViewVelocity*70) + all[i].ConditionScore*100 - all[i].Price/100
+			right := all[j].LikeCount*500 + all[j].RecentViewCount*100 + int(all[j].ViewVelocity*70) + all[j].ConditionScore*100 - all[j].Price/100
 			return left > right
 		default:
 			return all[i].CreatedAt.After(all[j].CreatedAt)
@@ -1119,15 +1265,82 @@ func (a *app) getItem(w http.ResponseWriter, r *http.Request) {
 	viewerID := a.optionalUserID(r)
 	a.store.mu.RLock()
 	item, ok := a.store.items[id]
-	if ok {
-		item = a.store.enrichItem(item, viewerID)
-	}
 	a.store.mu.RUnlock()
 	if !ok || item.SellerHidden || item.Status == "draft" {
 		writeError(w, http.StatusNotFound, "item not found")
 		return
 	}
+	if viewerID != item.SellerID {
+		if err := a.recordItemView(r, item.ID, viewerID); err != nil {
+			log.Printf("failed to record item view: %v", err)
+		}
+	}
+	a.store.mu.RLock()
+	item = a.store.enrichItem(a.store.items[id], viewerID)
+	a.store.mu.RUnlock()
 	writeJSON(w, http.StatusOK, item)
+}
+
+func (a *app) itemMetrics(w http.ResponseWriter, r *http.Request, user User) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid item id")
+		return
+	}
+	a.store.mu.RLock()
+	item, ok := a.store.items[id]
+	if ok && item.SellerID != user.ID {
+		a.store.mu.RUnlock()
+		writeError(w, http.StatusForbidden, "only seller can view item metrics")
+		return
+	}
+	metrics := a.store.itemMetrics(id)
+	a.store.mu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusNotFound, "item not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, metrics)
+}
+
+func (a *app) recordItemView(r *http.Request, itemID, viewerID int64) error {
+	now := time.Now()
+	viewerHash := a.viewerHash(r, viewerID)
+	a.store.mu.Lock()
+	defer a.store.mu.Unlock()
+	if !a.store.shouldRecordView(itemID, viewerHash, now) {
+		return nil
+	}
+	view := ItemView{ItemID: itemID, ViewerID: viewerID, ViewerHash: viewerHash, CreatedAt: now}
+	a.store.addViewInMemory(view)
+	if err := a.store.saveItemView(view); err != nil {
+		views := a.store.itemViews[itemID]
+		if len(views) > 0 {
+			a.store.itemViews[itemID] = views[:len(views)-1]
+		}
+		return err
+	}
+	return nil
+}
+
+func (a *app) viewerHash(r *http.Request, viewerID int64) string {
+	source := fmt.Sprintf("user:%d", viewerID)
+	if viewerID == 0 {
+		ip := r.Header.Get("X-Forwarded-For")
+		if comma := strings.Index(ip, ","); comma >= 0 {
+			ip = strings.TrimSpace(ip[:comma])
+		}
+		if ip == "" {
+			ip = r.Header.Get("X-Real-IP")
+		}
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		source = "anon:" + ip + ":" + r.UserAgent()
+	}
+	mac := hmac.New(sha256.New, a.jwtSecret)
+	mac.Write([]byte(source))
+	return fmt.Sprintf("%x", mac.Sum(nil))
 }
 
 func (a *app) createItem(w http.ResponseWriter, r *http.Request, user User) {
@@ -1636,6 +1849,57 @@ func (a *app) priceSuggest(w http.ResponseWriter, r *http.Request, user User) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (a *app) dynamicPrice(w http.ResponseWriter, r *http.Request, user User) {
+	var req DynamicPriceRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.ItemID > 0 {
+		a.store.mu.RLock()
+		item, ok := a.store.items[req.ItemID]
+		if ok && item.SellerID != user.ID {
+			a.store.mu.RUnlock()
+			writeError(w, http.StatusForbidden, "only seller can price this item")
+			return
+		}
+		if ok {
+			metrics := a.store.itemMetrics(item.ID)
+			req.Title = item.Title
+			req.CategoryID = item.CategoryID
+			req.Category = item.Category
+			req.CurrentPrice = item.Price
+			req.ConditionScore = item.ConditionScore
+			req.LikeCount = metrics.LikeCount
+			req.ViewCount = metrics.ViewCount
+			req.RecentViewCount = metrics.RecentViewCount
+			req.ViewVelocity = metrics.ViewVelocity
+		}
+		a.store.mu.RUnlock()
+		if !ok {
+			writeError(w, http.StatusNotFound, "item not found")
+			return
+		}
+	}
+	if req.CurrentPrice <= 0 {
+		writeError(w, http.StatusBadRequest, "currentPrice is required")
+		return
+	}
+	if req.ConditionScore <= 0 {
+		req.ConditionScore = 75
+	}
+	if req.TargetSellDays <= 0 {
+		req.TargetSellDays = 7
+	}
+	if req.TargetSellDays > 60 {
+		req.TargetSellDays = 60
+	}
+	if req.CategoryID == 0 {
+		req.CategoryID = categoryIDByLabel(req.Category)
+	}
+	req.Category = categoryLabelByID(req.CategoryID)
+	writeJSON(w, http.StatusOK, solveDynamicPrice(req))
+}
+
 func (a *app) fraudCheck(w http.ResponseWriter, r *http.Request, user User) {
 	var req Item
 	if !decode(w, r, &req) {
@@ -1734,6 +1998,108 @@ func heuristicPriceSuggestion(category string, conditionScore, targetSellDays in
 		MarketRange:     []int{price * 85 / 100, price * 115 / 100},
 		SellThroughDays: targetSellDays,
 	}
+}
+
+func solveDynamicPrice(req DynamicPriceRequest) DynamicPriceResult {
+	market := heuristicPriceSuggestion(req.Category, req.ConditionScore, req.TargetSellDays)
+	marketMid := max(1, (market.MarketRange[0]+market.MarketRange[1]+req.CurrentPrice)/3)
+	minimumPrice := req.MinimumPrice
+	if minimumPrice <= 0 {
+		minimumPrice = max(market.MarketRange[0]*90/100, req.CurrentPrice*75/100)
+	}
+	minimumPrice = max(100, minimumPrice)
+	maximumPrice := max(req.CurrentPrice*130/100, market.MarketRange[1]*115/100)
+	if maximumPrice < minimumPrice {
+		maximumPrice = minimumPrice + 1000
+	}
+	candidates := priceCandidates(minimumPrice, maximumPrice)
+	days := req.TargetSellDays
+	values := make([]float64, days+1)
+	chosenPrices := make([]int, days)
+	chosenLambda := make([]float64, days)
+	for day := days - 1; day >= 0; day-- {
+		bestValue := -1.0
+		bestPrice := candidates[0]
+		bestLambda := 0.0
+		remainingUrgency := 1 + float64(day)/float64(max(days, 1))*0.2
+		for _, price := range candidates {
+			lambda := saleIntensity(price, marketMid, req, remainingUrgency)
+			value := lambda*float64(price) + (1-lambda)*values[day+1]
+			if value > bestValue {
+				bestValue = value
+				bestPrice = price
+				bestLambda = lambda
+			}
+		}
+		values[day] = bestValue
+		chosenPrices[day] = bestPrice
+		chosenLambda[day] = bestLambda
+	}
+	path := make([]DynamicPricePoint, 0, days)
+	notSold := 1.0
+	expectedSellDays := days
+	for day := 0; day < days; day++ {
+		cumulative := 1 - notSold*(1-chosenLambda[day])
+		path = append(path, DynamicPricePoint{
+			Day:             day + 1,
+			Price:           chosenPrices[day],
+			SellProbability: math.Round(cumulative*1000) / 10,
+		})
+		if expectedSellDays == days && cumulative >= 0.5 {
+			expectedSellDays = day + 1
+		}
+		notSold *= 1 - chosenLambda[day]
+	}
+	confidence := 0.45 + math.Min(0.3, math.Log(float64(req.ViewCount+1))*0.06) + math.Min(0.18, float64(req.LikeCount)*0.025) + math.Min(0.07, req.ViewVelocity*0.015)
+	confidence = math.Round(math.Min(0.92, confidence)*100) / 100
+	explanation := fmt.Sprintf("閲覧%d件、直近%d件、いいね%d件を需要強度に反映し、%d日以内の期待収益が最大になる価格軌道を計算しました。", req.ViewCount, req.RecentViewCount, req.LikeCount, days)
+	return DynamicPriceResult{
+		RecommendedPrice: chosenPrices[0],
+		ExpectedSellDays: expectedSellDays,
+		PricePath:        path,
+		MarketRange:      []int{market.MarketRange[0], market.MarketRange[1]},
+		Confidence:       confidence,
+		Explanation:      explanation,
+	}
+}
+
+func priceCandidates(minimumPrice, maximumPrice int) []int {
+	steps := 15
+	if maximumPrice <= minimumPrice {
+		return []int{roundPrice(minimumPrice)}
+	}
+	candidates := make([]int, 0, steps+1)
+	seen := map[int]bool{}
+	for i := 0; i <= steps; i++ {
+		price := minimumPrice + (maximumPrice-minimumPrice)*i/steps
+		price = roundPrice(price)
+		if price < minimumPrice {
+			price = minimumPrice
+		}
+		if !seen[price] {
+			seen[price] = true
+			candidates = append(candidates, price)
+		}
+	}
+	sort.Ints(candidates)
+	return candidates
+}
+
+func saleIntensity(price, marketMid int, req DynamicPriceRequest, urgency float64) float64 {
+	priceRatio := float64(price) / float64(max(marketMid, 1))
+	conditionFactor := 0.55 + math.Min(1, float64(max(req.ConditionScore, 40))/100)*0.75
+	engagement := 1.0 + math.Min(0.9, float64(req.LikeCount)*0.055) + math.Min(0.7, float64(req.RecentViewCount)*0.035) + math.Min(0.8, req.ViewVelocity*0.08) + math.Min(0.35, math.Log(float64(req.ViewCount+1))*0.045)
+	targetFactor := math.Max(0.7, math.Min(1.5, 8.0/float64(max(req.TargetSellDays, 1))))
+	elasticity := 2.2
+	lambda := 0.08 * conditionFactor * engagement * targetFactor * urgency * math.Exp(-elasticity*(priceRatio-1))
+	return math.Max(0.01, math.Min(0.85, lambda))
+}
+
+func roundPrice(price int) int {
+	if price < 1000 {
+		return max(100, int(math.Round(float64(price)/50))*50)
+	}
+	return max(100, int(math.Round(float64(price)/100))*100)
 }
 
 func checkListingWithAI(ctx context.Context, item Item) (ListingCheckResult, error) {
@@ -1851,8 +2217,8 @@ func (a *app) recommendations(w http.ResponseWriter, r *http.Request, user User)
 	}
 	a.store.mu.RUnlock()
 	sort.SliceStable(all, func(i, j int) bool {
-		left := categoryWeight[all[i].Category]*10000 + all[i].LikeCount*500 + all[i].ConditionScore*100 - all[i].Price/100
-		right := categoryWeight[all[j].Category]*10000 + all[j].LikeCount*500 + all[j].ConditionScore*100 - all[j].Price/100
+		left := categoryWeight[all[i].Category]*10000 + all[i].LikeCount*500 + all[i].RecentViewCount*100 + int(all[i].ViewVelocity*70) + all[i].ConditionScore*100 - all[i].Price/100
+		right := categoryWeight[all[j].Category]*10000 + all[j].LikeCount*500 + all[j].RecentViewCount*100 + int(all[j].ViewVelocity*70) + all[j].ConditionScore*100 - all[j].Price/100
 		return left > right
 	})
 	start := (page - 1) * limit

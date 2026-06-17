@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS item_likes (
   FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS item_views (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  item_id BIGINT NOT NULL,
+  viewer_id BIGINT NULL,
+  viewer_hash CHAR(64) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_item_views_item_created (item_id, created_at),
+  INDEX idx_item_views_viewer (item_id, viewer_hash, created_at),
+  FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE,
+  FOREIGN KEY (viewer_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS transactions (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   item_id BIGINT NOT NULL,
