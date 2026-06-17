@@ -1,0 +1,51 @@
+name: Deploy Cloud Run
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  SERVICE: capcycle-api
+  REGION: asia-northeast1
+  IMAGE: asia-northeast1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/capcycle/capcycle-api:${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - run: gcloud auth configure-docker asia-northeast1-docker.pkg.dev --quiet
+
+      - run: docker build -t "$IMAGE" -f Dockerfile .
+
+      - run: docker push "$IMAGE"
+
+      - run: |
+          gcloud run deploy "$SERVICE" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --region="$REGION" \
+            --image="$IMAGE" \
+            --platform=managed \
+            --allow-unauthenticated \
+            --add-cloudsql-instances="${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
+            --set-env-vars="^|^CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}|PUBLIC_BASE_URL=${{ secrets.PUBLIC_BASE_URL }}|IMAGE_STORAGE=gcs|GCS_BUCKET=${{ secrets.GCS_BUCKET }}|GCS_PREFIX=uploads|GCS_PUBLIC_BASE_URL=${{ secrets.GCS_PUBLIC_BASE_URL }}|CLOUD_SQL_CONNECTION_NAME=${{ secrets.CLOUD_SQL_CONNECTION_NAME }}|GEMINI_MODEL=gemini-2.5-flash" \
+            --set-secrets="JWT_SECRET=JWT_SECRET:latest,DB_USER=DB_USER:latest,DB_PASSWORD=DB_PASSWORD:latest,DB_NAME=DB_NAME:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest"
+
+      - run: |
+          gcloud run services describe "$SERVICE" \
+            --project="${{ secrets.GCP_PROJECT_ID }}" \
+            --region="$REGION" \
+            --format="value(status.url)"

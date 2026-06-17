@@ -1,0 +1,13 @@
+services:
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_DATABASE: capcycle
+      MYSQL_USER: capcycle
+      MYSQL_PASSWORD: capcycle
+      MYSQL_ROOT_PASSWORD: capcycle-root
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
