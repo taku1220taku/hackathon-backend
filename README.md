@@ -57,7 +57,21 @@ JWT_SECRET
 DB_USER
 DB_PASSWORD
 DB_NAME
-GEMINI_API_KEY
 ```
+
+Gemini is called through Vertex AI by default:
+
+```text
+GEMINI_PROVIDER=vertex
+GCP_PROJECT_ID=term9-takuma-kono
+VERTEX_AI_LOCATION=global
+GEMINI_MODEL=gemini-3.1-pro-preview
+```
+
+The Cloud Run runtime service account must be allowed to call Vertex AI, for example with
+`roles/aiplatform.user` on `term9-takuma-kono`. For local development, run
+`gcloud auth application-default login` before using Vertex AI. `GEMINI_API_KEY` is still
+supported as a local fallback for the legacy Google AI Studio endpoint when
+`GEMINI_PROVIDER` is not `vertex`.
 
 The frontend repository should set `VITE_API_BASE_URL` to the Cloud Run URL.
