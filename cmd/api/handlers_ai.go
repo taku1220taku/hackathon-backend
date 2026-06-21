@@ -59,6 +59,7 @@ func (a *app) dynamicPrice(w http.ResponseWriter, r *http.Request, user User) {
 		if ok {
 			metrics := a.store.itemMetrics(item.ID)
 			req.Title = item.Title
+			req.Description = item.Description
 			req.CategoryID = item.CategoryID
 			req.Category = item.Category
 			req.CurrentPrice = item.Price

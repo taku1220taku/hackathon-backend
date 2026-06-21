@@ -42,12 +42,17 @@ func suggestPriceWithAI(ctx context.Context, title, description string, category
 	if targetSellDays > 60 {
 		targetSellDays = 60
 	}
+	profile := collectibleProfileFor(title, description, category, conditionScore)
+	heuristic := heuristicPriceSuggestion(title, description, category, conditionScore, targetSellDays)
 	if !geminiConfigured() {
-		return heuristicPriceSuggestion(category, conditionScore, targetSellDays), nil
+		return heuristic, nil
 	}
 	prompt := fmt.Sprintf(
-		"あなたはCapCycleの中古相場アナリストです。JSONのみを返してください。schema: {\"suggestedPrice\":number,\"marketRange\":number[],\"sellThroughDays\":number}。marketRangeは[min,max]の2要素。日本円で、10〜20代向けフリマの売れやすさを重視してください。ユーザーは約%d日以内に売りたいので、その日数に合う価格を提案してください。\n商品名: %s\n説明: %s\nカテゴリID: %d\nカテゴリ: %s\n状態スコア: %d",
+		"あなたはCapCycleの中古相場アナリストです。JSONのみを返してください。schema: {\"suggestedPrice\":number,\"marketRange\":number[],\"sellThroughDays\":number}。marketRangeは[min,max]の2要素。日本円で、10〜20代向けフリマの売れやすさを重視してください。ユーザーは約%d日以内に売りたいので、その日数に合う価格を提案してください。年代物、廃番、限定、初期仕様、Custom Shop、製造国、型番、コレクター需要ブランド、付属品、真贋リスクを必ず評価してください。希少性が強い商品は一般中古相場だけに寄せず、売却日数が短くても過度に値下げしないでください。\n希少性シグナル: %s\nリスクシグナル: %s\n希少性補正目安: %.2fx\n商品名: %s\n説明: %s\nカテゴリID: %d\nカテゴリ: %s\n状態スコア: %d",
 		targetSellDays,
+		strings.Join(profile.Signals, "、"),
+		strings.Join(profile.RiskSignals, "、"),
+		profile.Multiplier,
 		title,
 		description,
 		categoryID,
@@ -66,6 +71,7 @@ func suggestPriceWithAI(ctx context.Context, title, description string, category
 	if result.SuggestedPrice <= 0 || len(result.MarketRange) != 2 || result.SellThroughDays <= 0 {
 		return PriceSuggestionResult{}, errors.New("invalid gemini price suggestion")
 	}
+	result = applyCollectiblePriceFloor(result, heuristic, profile)
 	return result, nil
 }
 

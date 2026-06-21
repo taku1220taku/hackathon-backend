@@ -134,6 +134,7 @@ type ItemMetrics struct {
 type DynamicPriceRequest struct {
 	ItemID          int64   `json:"itemId"`
 	Title           string  `json:"title"`
+	Description     string  `json:"description"`
 	CategoryID      int64   `json:"categoryId"`
 	Category        string  `json:"category"`
 	CurrentPrice    int     `json:"currentPrice"`
