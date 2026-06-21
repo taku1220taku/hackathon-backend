@@ -66,6 +66,7 @@ GEMINI_PROVIDER=vertex
 GCP_PROJECT_ID=astute-harbor-499700-p3
 VERTEX_AI_LOCATION=global
 GEMINI_MODEL=gemini-2.5-pro
+GEMINI_TIMEOUT_SECONDS=75
 ```
 
 The Cloud Run runtime service account must be allowed to call Vertex AI, for example with

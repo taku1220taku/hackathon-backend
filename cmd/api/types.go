@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"sync"
 	"time"
@@ -173,5 +174,5 @@ type ListingAssistResult struct {
 }
 
 type ListingAssistant interface {
-	Assist(r ListingAssistRequest) (ListingAssistResult, error)
+	Assist(ctx context.Context, r ListingAssistRequest) (ListingAssistResult, error)
 }

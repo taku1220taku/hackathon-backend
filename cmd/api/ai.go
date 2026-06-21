@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -117,7 +118,7 @@ func newAssistant() ListingAssistant {
 	return mockAssistant{}
 }
 
-func (mockAssistant) Assist(r ListingAssistRequest) (ListingAssistResult, error) {
+func (mockAssistant) Assist(ctx context.Context, r ListingAssistRequest) (ListingAssistResult, error) {
 	memo := strings.TrimSpace(r.Memo)
 	if memo == "" {
 		memo = "写真から角スレと使用感を検出"
@@ -140,8 +141,8 @@ type geminiAssistant struct {
 	model  string
 }
 
-func (a geminiAssistant) Assist(r ListingAssistRequest) (ListingAssistResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+func (a geminiAssistant) Assist(ctx context.Context, r ListingAssistRequest) (ListingAssistResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, geminiTimeout())
 	defer cancel()
 	prompt := "あなたはCapCycleのフリマ出品補助AIです。JSONのみを返してください。" +
 		"schema: {\"title\":string,\"description\":string,\"categoryId\":number,\"category\":string,\"conditionScore\":number,\"conditionNotes\":string,\"suggestedTags\":string[],\"suggestedPrice\":number,\"sellThroughDays\":number}。" +
@@ -155,7 +156,7 @@ func (a geminiAssistant) Assist(r ListingAssistRequest) (ListingAssistResult, er
 	}
 	text, err := callGeminiWithImages(ctx, a.apiKey, a.model, prompt, true, images)
 	if err != nil {
-		return ListingAssistResult{}, err
+		return ListingAssistResult{}, friendlyTimeoutError(err)
 	}
 	var result ListingAssistResult
 	if err := json.Unmarshal([]byte(cleanJSON(text)), &result); err != nil {
@@ -204,6 +205,14 @@ func geminiProvider() string {
 
 func geminiModel() string {
 	return env("GEMINI_MODEL", "gemini-2.5-pro")
+}
+
+func geminiTimeout() time.Duration {
+	seconds, err := strconv.Atoi(env("GEMINI_TIMEOUT_SECONDS", "75"))
+	if err != nil || seconds <= 0 {
+		seconds = 75
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func vertexProjectID() string {
@@ -390,6 +399,13 @@ func friendlyGeminiError(statusCode int, body []byte) error {
 	default:
 		return fmt.Errorf("Gemini APIエラーが発生しました (%d)", statusCode)
 	}
+}
+
+func friendlyTimeoutError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("AI生成に時間がかかっています。画像枚数を減らすか、少し待って再試行してください。")
+	}
+	return err
 }
 
 func cleanJSON(text string) string {

@@ -13,7 +13,7 @@ func (a *app) listingAssist(w http.ResponseWriter, r *http.Request, user User) {
 	if !decode(w, r, &req) {
 		return
 	}
-	result, err := a.ai.Assist(req)
+	result, err := a.ai.Assist(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
