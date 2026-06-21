@@ -270,7 +270,7 @@ func callGeminiWithImages(ctx context.Context, apiKey, model, prompt string, jso
 	}
 	body := map[string]any{
 		"contents": []map[string]any{
-			{"parts": parts},
+			{"role": "user", "parts": parts},
 		},
 	}
 	if jsonOnly {
