@@ -41,7 +41,7 @@ jobs:
             --platform=managed \
             --allow-unauthenticated \
             --add-cloudsql-instances="${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
-            --set-env-vars="^|^CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}|PUBLIC_BASE_URL=${{ secrets.PUBLIC_BASE_URL }}|IMAGE_STORAGE=gcs|GCS_BUCKET=${{ secrets.GCS_BUCKET }}|GCS_PREFIX=uploads|GCS_PUBLIC_BASE_URL=${{ secrets.GCS_PUBLIC_BASE_URL }}|CLOUD_SQL_CONNECTION_NAME=${{ secrets.CLOUD_SQL_CONNECTION_NAME }}|GEMINI_PROVIDER=vertex|GCP_PROJECT_ID=term9-takuma-kono|VERTEX_AI_LOCATION=global|GEMINI_MODEL=gemini-3.1-pro-preview" \
+            --set-env-vars="^|^CORS_ORIGIN=${{ secrets.CORS_ORIGIN }}|PUBLIC_BASE_URL=${{ secrets.PUBLIC_BASE_URL }}|IMAGE_STORAGE=gcs|GCS_BUCKET=${{ secrets.GCS_BUCKET }}|GCS_PREFIX=uploads|GCS_PUBLIC_BASE_URL=${{ secrets.GCS_PUBLIC_BASE_URL }}|CLOUD_SQL_CONNECTION_NAME=${{ secrets.CLOUD_SQL_CONNECTION_NAME }}|GEMINI_PROVIDER=vertex|GCP_PROJECT_ID=astute-harbor-499700-p3|VERTEX_AI_LOCATION=global|GEMINI_MODEL=gemini-2.5-pro" \
             --set-secrets="JWT_SECRET=JWT_SECRET:latest,DB_USER=DB_USER:latest,DB_PASSWORD=DB_PASSWORD:latest,DB_NAME=DB_NAME:latest"
 
       - run: |

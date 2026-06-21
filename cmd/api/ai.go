@@ -203,11 +203,11 @@ func geminiProvider() string {
 }
 
 func geminiModel() string {
-	return env("GEMINI_MODEL", "gemini-3.1-pro-preview")
+	return env("GEMINI_MODEL", "gemini-2.5-pro")
 }
 
 func vertexProjectID() string {
-	return env("GCP_PROJECT_ID", "term9-takuma-kono")
+	return env("GCP_PROJECT_ID", "astute-harbor-499700-p3")
 }
 
 func vertexLocation() string {
@@ -381,6 +381,9 @@ func friendlyGeminiError(statusCode int, body []byte) error {
 	case statusCode == http.StatusTooManyRequests || provider.Error.Status == "RESOURCE_EXHAUSTED":
 		return errors.New("Gemini APIの利用上限に達しました。時間を置いて再試行してください。")
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		if geminiProvider() == "vertex" {
+			return errors.New("Vertex AIの権限またはモデル利用設定を確認してください。")
+		}
 		return errors.New("Gemini APIキーを確認してください。")
 	case provider.Error.Message != "":
 		return fmt.Errorf("Gemini APIエラー: %s", provider.Error.Message)

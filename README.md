@@ -63,13 +63,14 @@ Gemini is called through Vertex AI by default:
 
 ```text
 GEMINI_PROVIDER=vertex
-GCP_PROJECT_ID=term9-takuma-kono
+GCP_PROJECT_ID=astute-harbor-499700-p3
 VERTEX_AI_LOCATION=global
-GEMINI_MODEL=gemini-3.1-pro-preview
+GEMINI_MODEL=gemini-2.5-pro
 ```
 
 The Cloud Run runtime service account must be allowed to call Vertex AI, for example with
-`roles/aiplatform.user` on `term9-takuma-kono`. For local development, run
+`roles/aiplatform.user` on the `astute-harbor-499700-p3` project. The display name is
+`term9-takuma-kono`, but `GCP_PROJECT_ID` must use the actual project ID. For local development, run
 `gcloud auth application-default login` before using Vertex AI. `GEMINI_API_KEY` is still
 supported as a local fallback for the legacy Google AI Studio endpoint when
 `GEMINI_PROVIDER` is not `vertex`.
