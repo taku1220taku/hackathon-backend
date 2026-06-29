@@ -138,6 +138,7 @@ type DynamicPriceRequest struct {
 	CategoryID      int64   `json:"categoryId"`
 	Category        string  `json:"category"`
 	CurrentPrice    int     `json:"currentPrice"`
+	MarketRange     []int   `json:"marketRange"`
 	ConditionScore  int     `json:"conditionScore"`
 	LikeCount       int     `json:"likeCount"`
 	ViewCount       int     `json:"viewCount"`

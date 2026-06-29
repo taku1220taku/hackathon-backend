@@ -12,6 +12,80 @@ import (
 	"time"
 )
 
+type itemMutationRequest struct {
+	Title          *string   `json:"title"`
+	Description    *string   `json:"description"`
+	Price          *int      `json:"price"`
+	ShippingFee    *int      `json:"shippingFee"`
+	CategoryID     *int64    `json:"categoryId"`
+	Category       *string   `json:"category"`
+	Status         *string   `json:"status"`
+	ConditionScore *int      `json:"conditionScore"`
+	Context        *string   `json:"context"`
+	Images         *[]string `json:"images"`
+}
+
+func applyItemMutation(item *Item, req itemMutationRequest) {
+	if req.Title != nil {
+		item.Title = *req.Title
+	}
+	if req.Description != nil {
+		item.Description = *req.Description
+	}
+	if req.Price != nil {
+		item.Price = *req.Price
+	}
+	if req.ShippingFee != nil {
+		item.ShippingFee = *req.ShippingFee
+	}
+	if req.CategoryID != nil {
+		item.CategoryID = *req.CategoryID
+	}
+	if req.Category != nil {
+		item.Category = *req.Category
+	}
+	if req.Status != nil {
+		item.Status = *req.Status
+	}
+	if req.ConditionScore != nil {
+		item.ConditionScore = *req.ConditionScore
+	}
+	if req.Context != nil {
+		item.Context = *req.Context
+	}
+	if req.Images != nil {
+		item.Images = append([]string(nil), (*req.Images)...)
+	}
+	normalizeItemCategory(item)
+}
+
+func validateItemMutation(item Item) error {
+	if item.Status != "draft" && item.Status != "published" {
+		return fmt.Errorf("status must be draft or published")
+	}
+	if item.Price < 0 {
+		return fmt.Errorf("price must be zero or greater")
+	}
+	if item.ShippingFee < 0 {
+		return fmt.Errorf("shippingFee must be zero or greater")
+	}
+	if item.ConditionScore < 0 || item.ConditionScore > 100 {
+		return fmt.Errorf("conditionScore must be 0-100")
+	}
+	if item.Status == "published" {
+		if strings.TrimSpace(item.Title) == "" {
+			return fmt.Errorf("title is required to publish")
+		}
+		if strings.TrimSpace(item.Description) == "" {
+			return fmt.Errorf("description is required to publish")
+		}
+		if item.Price <= 0 {
+			return fmt.Errorf("positive price is required to publish")
+		}
+	}
+	return nil
+}
+
 func (a *app) listItems(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	category := strings.ToLower(r.URL.Query().Get("category"))
@@ -109,6 +183,22 @@ func (a *app) getItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, item)
 }
 
+func (a *app) getMyItem(w http.ResponseWriter, r *http.Request, user User) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid item id")
+		return
+	}
+	a.store.mu.RLock()
+	defer a.store.mu.RUnlock()
+	item, ok := a.store.items[id]
+	if !ok || item.SellerID != user.ID || item.SellerHidden {
+		writeError(w, http.StatusNotFound, "item not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.store.enrichItemForSeller(item))
+}
+
 func (a *app) itemMetrics(w http.ResponseWriter, r *http.Request, user User) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -172,31 +262,29 @@ func (a *app) viewerHash(r *http.Request, viewerID int64) string {
 }
 
 func (a *app) createItem(w http.ResponseWriter, r *http.Request, user User) {
-	var req Item
+	var req itemMutationRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	normalizeItemCategory(&req)
-	if req.Title == "" || req.Price <= 0 {
-		writeError(w, http.StatusBadRequest, "title and price are required")
+	item := Item{Status: "draft", CategoryID: 801, ShippingFee: 700}
+	applyItemMutation(&item, req)
+	if err := validateItemMutation(item); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	if req.Status == "" {
-		req.Status = "draft"
 	}
 	a.store.mu.Lock()
 	defer a.store.mu.Unlock()
-	req.ID = a.store.nextItemID
+	item.ID = a.store.nextItemID
 	a.store.nextItemID++
-	req.SellerID = user.ID
-	req.SellerHidden = false
-	req.CreatedAt = time.Now()
-	a.store.items[req.ID] = req
-	if err := a.store.saveItem(req); err != nil {
+	item.SellerID = user.ID
+	item.SellerHidden = false
+	item.CreatedAt = time.Now()
+	if err := a.store.saveItem(item); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save item")
 		return
 	}
-	writeJSON(w, http.StatusCreated, a.store.enrichItemForSeller(req))
+	a.store.items[item.ID] = item
+	writeJSON(w, http.StatusCreated, a.store.enrichItemForSeller(item))
 }
 
 func (a *app) updateItem(w http.ResponseWriter, r *http.Request, user User) {
@@ -205,7 +293,7 @@ func (a *app) updateItem(w http.ResponseWriter, r *http.Request, user User) {
 		writeError(w, http.StatusBadRequest, "invalid item id")
 		return
 	}
-	var req Item
+	var req itemMutationRequest
 	if !decode(w, r, &req) {
 		return
 	}
@@ -220,46 +308,31 @@ func (a *app) updateItem(w http.ResponseWriter, r *http.Request, user User) {
 		writeError(w, http.StatusForbidden, "only seller can update item")
 		return
 	}
-	if req.Title != "" {
-		item.Title = req.Title
+	if item.Status == "sold" {
+		writeError(w, http.StatusConflict, "sold item cannot be edited")
+		return
 	}
-	if req.Description != "" {
-		item.Description = req.Description
+	next := item
+	applyItemMutation(&next, req)
+	if err := validateItemMutation(next); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	if req.Price > 0 {
-		item.Price = req.Price
-	}
-	if req.Category != "" {
-		item.Category = req.Category
-	}
-	if req.CategoryID > 0 {
-		item.CategoryID = req.CategoryID
-	}
-	normalizeItemCategory(&item)
-	if req.Status != "" {
-		if req.Status != "published" && req.Status != item.Status && a.store.itemHasIncompleteTransaction(item.ID, user.ID) {
+	if next.Status != item.Status {
+		if next.Status != "published" && a.store.itemHasIncompleteTransaction(item.ID, user.ID) {
 			writeError(w, http.StatusBadRequest, "item with active transaction cannot be unpublished")
 			return
 		}
-		item.Status = req.Status
-		if req.Status == "published" {
-			item.SellerHidden = false
+		if next.Status == "published" {
+			next.SellerHidden = false
 		}
 	}
-	if req.ConditionScore > 0 {
-		item.ConditionScore = req.ConditionScore
-	}
-	if len(req.Images) > 0 {
-		item.Images = req.Images
-	}
-	item.Context = req.Context
-	item.ShippingFee = req.ShippingFee
-	a.store.items[id] = item
-	if err := a.store.saveItem(item); err != nil {
+	if err := a.store.saveItem(next); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save item")
 		return
 	}
-	writeJSON(w, http.StatusOK, a.store.enrichItemForSeller(item))
+	a.store.items[id] = next
+	writeJSON(w, http.StatusOK, a.store.enrichItemForSeller(next))
 }
 
 func (a *app) deleteItem(w http.ResponseWriter, r *http.Request, user User) {

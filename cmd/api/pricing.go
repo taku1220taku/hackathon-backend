@@ -85,6 +85,9 @@ func heuristicPriceSuggestion(title, description, category string, conditionScor
 func solveDynamicPrice(req DynamicPriceRequest) DynamicPriceResult {
 	profile := collectibleProfileFor(req.Title, req.Description, req.Category, req.ConditionScore)
 	market := heuristicPriceSuggestion(req.Title, req.Description, req.Category, req.ConditionScore, req.TargetSellDays)
+	if len(req.MarketRange) == 2 && req.MarketRange[0] > 0 && req.MarketRange[1] >= req.MarketRange[0] {
+		market.MarketRange = []int{req.MarketRange[0], req.MarketRange[1]}
+	}
 	if len(profile.Signals) > 0 && req.CurrentPrice > market.MarketRange[1] {
 		market.MarketRange[0] = max(market.MarketRange[0], req.CurrentPrice*75/100)
 		market.MarketRange[1] = max(market.MarketRange[1], req.CurrentPrice*125/100)
@@ -93,41 +96,62 @@ func solveDynamicPrice(req DynamicPriceRequest) DynamicPriceResult {
 	marketMid := max(1, (market.MarketRange[0]+market.MarketRange[1]+req.CurrentPrice)/3)
 	minimumPrice := req.MinimumPrice
 	if minimumPrice <= 0 {
-		minimumPrice = max(market.MarketRange[0]*90/100, req.CurrentPrice*75/100)
+		marketFloor := market.MarketRange[0] * 90 / 100
+		if marketFloor >= req.CurrentPrice {
+			marketFloor = req.CurrentPrice * 75 / 100
+		}
+		minimumPrice = max(marketFloor, req.CurrentPrice*75/100)
 		if len(profile.Signals) > 0 {
-			minimumPrice = max(market.MarketRange[0]*95/100, req.CurrentPrice*85/100)
+			collectibleFloor := market.MarketRange[0] * 95 / 100
+			if collectibleFloor >= req.CurrentPrice {
+				collectibleFloor = req.CurrentPrice * 85 / 100
+			}
+			minimumPrice = max(collectibleFloor, req.CurrentPrice*85/100)
 		}
 	}
-	minimumPrice = max(100, minimumPrice)
-	maximumPrice := max(req.CurrentPrice*130/100, market.MarketRange[1]*115/100)
-	if len(profile.Signals) > 0 {
-		maximumPrice = max(req.CurrentPrice*145/100, market.MarketRange[1]*120/100)
+	minimumPrice = min(req.CurrentPrice, max(100, minimumPrice))
+	candidates := priceCandidates(minimumPrice, req.CurrentPrice)
+	if !containsInt(candidates, req.CurrentPrice) {
+		candidates = append(candidates, req.CurrentPrice)
+		sort.Ints(candidates)
 	}
-	if maximumPrice < minimumPrice {
-		maximumPrice = minimumPrice + 1000
-	}
-	candidates := priceCandidates(minimumPrice, maximumPrice)
 	days := req.TargetSellDays
-	values := make([]float64, days+1)
+	values := make([][]float64, days+1)
+	choices := make([][]int, days)
+	for day := range values {
+		values[day] = make([]float64, len(candidates))
+	}
+	for day := range choices {
+		choices[day] = make([]int, len(candidates))
+	}
+	for day := days - 1; day >= 1; day-- {
+		remainingUrgency := 1 + float64(day)/float64(max(days, 1))*0.2
+		for maxIndex := range candidates {
+			bestValue := -1.0
+			bestIndex := 0
+			for priceIndex := 0; priceIndex <= maxIndex; priceIndex++ {
+				price := candidates[priceIndex]
+				lambda := saleIntensity(price, marketMid, req, remainingUrgency)
+				value := lambda*float64(price) + (1-lambda)*values[day+1][priceIndex]
+				if value > bestValue {
+					bestValue = value
+					bestIndex = priceIndex
+				}
+			}
+			values[day][maxIndex] = bestValue
+			choices[day][maxIndex] = bestIndex
+		}
+	}
 	chosenPrices := make([]int, days)
 	chosenLambda := make([]float64, days)
-	for day := days - 1; day >= 0; day-- {
-		bestValue := -1.0
-		bestPrice := candidates[0]
-		bestLambda := 0.0
-		remainingUrgency := 1 + float64(day)/float64(max(days, 1))*0.2
-		for _, price := range candidates {
-			lambda := saleIntensity(price, marketMid, req, remainingUrgency)
-			value := lambda*float64(price) + (1-lambda)*values[day+1]
-			if value > bestValue {
-				bestValue = value
-				bestPrice = price
-				bestLambda = lambda
-			}
-		}
-		values[day] = bestValue
-		chosenPrices[day] = bestPrice
-		chosenLambda[day] = bestLambda
+	currentIndex := sort.SearchInts(candidates, req.CurrentPrice)
+	chosenPrices[0] = req.CurrentPrice
+	chosenLambda[0] = saleIntensity(req.CurrentPrice, marketMid, req, 1)
+	for day := 1; day < days; day++ {
+		currentIndex = choices[day][currentIndex]
+		chosenPrices[day] = candidates[currentIndex]
+		urgency := 1 + float64(day)/float64(max(days, 1))*0.2
+		chosenLambda[day] = saleIntensity(chosenPrices[day], marketMid, req, urgency)
 	}
 	path := make([]DynamicPricePoint, 0, days)
 	notSold := 1.0
@@ -294,6 +318,15 @@ func collectibleProfileFor(title, description, category string, conditionScore i
 }
 
 func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsInt(values []int, target int) bool {
 	for _, value := range values {
 		if value == target {
 			return true

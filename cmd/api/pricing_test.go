@@ -37,3 +37,37 @@ func TestDynamicPricePreservesCollectibleCurrentPrice(t *testing.T) {
 		t.Fatalf("expected explanation to mention collectible adjustment, got %q", result.Explanation)
 	}
 }
+
+func TestDynamicPriceStartsAtSuggestedPriceAndNeverIncreases(t *testing.T) {
+	result := solveDynamicPrice(DynamicPriceRequest{
+		Title:           "ProCo RAT 2 ディストーション",
+		Description:     "目立つ傷や汚れはなく、全体的に綺麗な状態です。",
+		CategoryID:      502,
+		Category:        "おもちゃ・ホビー・グッズ / 楽器/機材",
+		CurrentPrice:    6800,
+		MarketRange:     []int{6000, 8000},
+		ConditionScore:  90,
+		TargetSellDays:  7,
+		ViewCount:       0,
+		RecentViewCount: 0,
+		LikeCount:       0,
+	})
+
+	if result.RecommendedPrice != 6800 {
+		t.Fatalf("expected first price to match the suggested price, got %d", result.RecommendedPrice)
+	}
+	if len(result.PricePath) != 7 {
+		t.Fatalf("expected 7 price points, got %d", len(result.PricePath))
+	}
+	for index, point := range result.PricePath {
+		if index == 0 && point.Price != 6800 {
+			t.Fatalf("expected day 1 price 6800, got %d", point.Price)
+		}
+		if index > 0 && point.Price > result.PricePath[index-1].Price {
+			t.Fatalf("expected non-increasing prices, day %d rose from %d to %d", point.Day, result.PricePath[index-1].Price, point.Price)
+		}
+	}
+	if result.MarketRange[0] != 6000 || result.MarketRange[1] != 8000 {
+		t.Fatalf("expected provided market range, got %v", result.MarketRange)
+	}
+}

@@ -10,7 +10,7 @@ docker compose up -d mysql
 go run ./cmd/api
 ```
 
-Default local credentials are defined in `.env.example`. The API falls back to in-memory storage if MySQL is unavailable.
+Default local credentials are defined in `.env.example`. MySQL is required by default. For an explicitly non-persistent local demo, set `ALLOW_IN_MEMORY_STORE=true`.
 
 ```text
 DB_HOST=127.0.0.1

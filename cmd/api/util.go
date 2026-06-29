@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"os"
+	"strings"
 )
 
 func env(key, fallback string) string {
@@ -10,6 +11,14 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func b64(s string) string {
