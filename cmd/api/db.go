@@ -45,7 +45,7 @@ func mysqlDSN() string {
 }
 
 func migrateDB(db *sql.DB) error {
-	raw, err := os.ReadFile("migrations/001_init.sql")
+	raw, err := os.ReadFile(env("MIGRATION_FILE", "migrations/001_init.sql"))
 	if err != nil {
 		return err
 	}

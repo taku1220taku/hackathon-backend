@@ -26,6 +26,7 @@ jobs:
           --health-retries=20
     env:
       TEST_DATABASE_URL: "capcycle:capcycle@tcp(127.0.0.1:3306)/capcycle?parseTime=true&multiStatements=true&charset=utf8mb4,utf8"
+      MIGRATION_FILE: "../../migrations/001_init.sql"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
